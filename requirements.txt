@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+google-genai
+streamlit
+requests
+rank_bm25
