@@ -113,7 +113,7 @@ The current hackathon deployment is intentionally local: one FastAPI instance, S
 - `active_workers`
 - `configured_concurrency`
 
-`GET /health` additionally reports the in-memory queue depth, deferred backlog, worker count, and configured Gemini model. These metrics make backpressure and gradual queue draining visible during the demonstration.
+`GET /health` additionally reports only the boolean Gemini readiness signal plus the in-memory queue depth, deferred backlog, and worker count. These metrics make backpressure and gradual queue draining visible during the demonstration without exposing environment secrets.
 
 ### Safe load demonstration
 

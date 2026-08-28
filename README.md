@@ -73,6 +73,7 @@ google-genai
 streamlit
 requests
 rank_bm25
+python-dotenv
 ```
 
 ## Environment configuration
@@ -160,7 +161,7 @@ uvicorn app:app --reload
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| GET | `/health` | Database, model, worker, and queue health |
+| GET | `/health` | Database, Gemini readiness, worker, and queue health |
 | GET | `/stats` | Real total, Pending, Processing, Analyzed, and Failed counts |
 | GET | `/processes` | Paginated process registry; supports `status`, `limit`, `offset`, and `name` |
 | GET | `/processes/{id}` | Full process intelligence record |

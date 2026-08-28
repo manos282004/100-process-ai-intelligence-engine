@@ -5,3 +5,4 @@ google-genai
 streamlit
 requests
 rank_bm25
+python-dotenv

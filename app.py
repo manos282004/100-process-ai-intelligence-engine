@@ -24,6 +24,7 @@ from typing import Any, Literal, Optional
 from urllib.parse import quote_plus, urlparse
 
 import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
@@ -34,6 +35,11 @@ try:
 except ImportError:  # Makes the failure message clearer if requirements were skipped.
     genai = None  # type: ignore[assignment]
     types = None  # type: ignore[assignment]
+
+
+# Load local configuration before any environment-backed application settings
+# or Gemini credentials are read. The real .env file is intentionally ignored.
+load_dotenv()
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +671,7 @@ def is_retryable_gemini_error(error: BaseException) -> bool:
 def analyse_with_gemini(process_name: str, research: ResearchResult) -> ProcessIntelligence:
     """Isolated Gemini provider function; it can be replaced by a local model later."""
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
     if genai is None or types is None:
@@ -1001,8 +1007,7 @@ async def health() -> dict[str, Any]:
         return {
             "status": "ok",
             "database": "connected",
-            "gemini_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
-            "gemini_model": GEMINI_MODEL,
+            "gemini_configured": bool((os.getenv("GEMINI_API_KEY") or "").strip()),
             "workers": len(worker_tasks),
             "active_workers": sum(1 for task in worker_tasks if not task.done()),
             "configured_concurrency": MAX_AI_CONCURRENCY,
@@ -1161,7 +1166,7 @@ async def advisory_chat(request: ChatRequest) -> dict[str, Any]:
     hits = search_bm25(request.question, request.limit)
     if not hits:
         raise HTTPException(status_code=404, detail="No persisted intelligence matched the question")
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
         raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured for advisory synthesis")
     context_blocks = []
