@@ -227,7 +227,11 @@ def main() -> None:
         try:
             health = api_request("GET", "/health")
             st.success("FastAPI connected")
-            st.caption(f"Workers: {health.get('workers', 0)} · Queue depth: {health.get('queue_depth', 0)}")
+            st.caption(
+                f"Workers: {health.get('workers', 0)} (active {health.get('active_workers', 0)}) · "
+                f"Queue depth: {health.get('queue_depth', 0)} · "
+                f"AI concurrency: {health.get('configured_concurrency', 0)}"
+            )
             if not health.get("gemini_configured"):
                 st.warning("GEMINI_API_KEY is not configured")
         except Exception as exc:
@@ -270,4 +274,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

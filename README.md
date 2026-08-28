@@ -94,6 +94,7 @@ Optional runtime controls:
 ```powershell
 $env:WORKER_CONCURRENCY="3"
 $env:AI_CONCURRENCY="2"
+$env:QUEUE_MAX_SIZE="100"
 $env:GEMINI_REQUEST_DELAY="1.0"
 $env:GEMINI_MAX_ATTEMPTS="5"
 $env:GEMINI_BACKOFF_BASE="2.0"
@@ -168,6 +169,7 @@ uvicorn app:app --reload
 | POST | `/processes/{id}/retry` | Retry one Pending or Failed record |
 | POST | `/processes/queue-pending` | Queue a bounded Pending batch; for example `?limit=5` |
 | POST | `/processes/retry-failed` | Reset and queue a bounded Failed batch |
+| POST | `/load-test/processes` | Persist up to 1,000 Pending test records without calling Gemini by default |
 | GET | `/search` | BM25 search over persisted process records |
 | POST | `/chat` | BM25 retrieval followed by grounded Gemini advisory synthesis |
 
@@ -181,6 +183,17 @@ Invoke-RestMethod -Method Post `
 ```
 
 The response is immediate. Poll `GET /processes/{id}` or refresh the dashboard to follow the real state.
+
+For a safe ingestion/load demonstration, persist 1,000 Pending records without launching AI work:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8000/load-test/processes `
+  -ContentType "application/json" `
+  -Body '{"count":1000,"prefix":"Scalability Test Process","queue":false}'
+```
+
+Queue a small controlled batch afterward with `/processes/queue-pending?limit=5`.
 
 ## Testing and verification
 
@@ -210,7 +223,7 @@ Invoke-RestMethod -Method Post "http://127.0.0.1:8000/processes/queue-pending?li
 The current local implementation is deliberately lightweight but has the correct control points:
 
 - FastAPI inserts records and queues IDs without waiting for AI work.
-- `asyncio.Queue` absorbs bursts and workers consume jobs independently.
+- SQLite Pending rows provide a persistent backlog; the bounded `asyncio.Queue` absorbs bursts and a dispatcher drains deferred IDs as capacity becomes available.
 - The semaphore prevents a 1,000-record batch from creating 1,000 simultaneous Gemini calls.
 - Request pacing and retry backoff protect the external model service.
 - SQLite persistence supports pagination and restart survival for the local challenge.

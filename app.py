@@ -47,6 +47,7 @@ WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_REQUEST_TIMEOUT", "20"))
 DEFAULT_WORKER_COUNT = max(1, min(int(os.getenv("WORKER_CONCURRENCY", "3")), 3))
 MAX_AI_CONCURRENCY = max(1, min(int(os.getenv("AI_CONCURRENCY", "2")), 3))
+QUEUE_MAX_SIZE = max(10, min(int(os.getenv("QUEUE_MAX_SIZE", "100")), 1000))
 GEMINI_REQUEST_DELAY_SECONDS = max(0.0, float(os.getenv("GEMINI_REQUEST_DELAY", "1.0")))
 GEMINI_MAX_ATTEMPTS = max(5, min(int(os.getenv("GEMINI_MAX_ATTEMPTS", "5")), 10))
 GEMINI_BACKOFF_BASE_SECONDS = max(0.1, float(os.getenv("GEMINI_BACKOFF_BASE", "2.0")))
@@ -87,6 +88,12 @@ class ProcessIntelligence(BaseModel):
 
 class ProcessCreate(BaseModel):
     name: str = Field(min_length=2, max_length=200)
+
+
+class LoadTestRequest(BaseModel):
+    count: int = Field(default=1000, ge=1, le=1000)
+    prefix: str = Field(default="Load Test Process", min_length=2, max_length=150)
+    queue: bool = False
 
 
 class ChatRequest(BaseModel):
@@ -383,12 +390,16 @@ def get_stats() -> dict[str, int]:
         ).fetchall()
     counts = {row["status"]: int(row["count"]) for row in rows}
     processing = len(active_jobs)
+    active_workers = sum(1 for task in worker_tasks if not task.done())
     return {
         "total": sum(counts.values()),
         "pending": max(counts.get("Pending", 0) - processing, 0),
         "analyzed": counts.get("Analyzed", 0),
         "failed": counts.get("Failed", 0),
         "processing": processing,
+        "queue_depth": process_queue.qsize() + len(deferred_process_ids),
+        "active_workers": active_workers,
+        "configured_concurrency": MAX_AI_CONCURRENCY,
     }
 
 
@@ -402,6 +413,38 @@ def create_process(name: str) -> dict[str, Any]:
             raise ValueError("A process with this name already exists") from exc
         process_id = int(cursor.lastrowid)
     return fetch_process(process_id)  # type: ignore[return-value]
+
+
+def create_load_test_batch(count: int, prefix: str) -> tuple[list[int], int]:
+    """Persist a bounded synthetic batch without invoking research or Gemini."""
+
+    ids: list[int] = []
+    existing = 0
+    with db_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for sequence in range(1, count + 1):
+                name = f"{prefix.strip()} {sequence:04d}"
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO processes (name, status) VALUES (?, 'Pending')",
+                    (name,),
+                )
+                if cursor.rowcount == 1:
+                    process_id = int(cursor.lastrowid)
+                else:
+                    row = connection.execute(
+                        "SELECT id FROM processes WHERE name = ? COLLATE NOCASE", (name,)
+                    ).fetchone()
+                    if not row:
+                        raise RuntimeError(f"Could not locate load-test process '{name}'")
+                    process_id = int(row["id"])
+                    existing += 1
+                ids.append(process_id)
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+    return ids, existing
 
 
 def set_process_failed(process_id: int, reason: str) -> None:
@@ -742,10 +785,12 @@ def search_bm25(question: str, limit: int = 5) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-process_queue: asyncio.Queue[int] = asyncio.Queue()
+process_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
 worker_tasks: list[asyncio.Task[None]] = []
+dispatcher_task: Optional[asyncio.Task[None]] = None
 active_jobs: dict[int, str] = {}
 queued_process_ids: set[int] = set()
+deferred_process_ids: set[int] = set()
 gemini_semaphore: Optional[asyncio.Semaphore] = None
 gemini_rate_lock: Optional[asyncio.Lock] = None
 last_gemini_request_at = 0.0
@@ -754,16 +799,46 @@ last_gemini_request_at = 0.0
 def enqueue_process_id(process_id: int) -> bool:
     """Queue a process once; active and already queued IDs are ignored safely."""
 
-    if process_id in queued_process_ids or process_id in active_jobs:
+    if process_id in queued_process_ids or process_id in deferred_process_ids or process_id in active_jobs:
         logger.info("Process %s already queued or processing; skipping duplicate", process_id)
         return False
     record = fetch_process(process_id)
     if not record or record["status"] == "Analyzed":
         return False
+    if process_queue.full():
+        deferred_process_ids.add(process_id)
+        logger.warning("Process %s queued in persistent Pending backlog; queue is at capacity", process_id)
+        return True
     queued_process_ids.add(process_id)
     process_queue.put_nowait(process_id)
     logger.info("Process %s queued", process_id)
     return True
+
+
+def fill_queue_from_backlog() -> int:
+    """Move persisted/deferred Pending IDs into the bounded asyncio queue."""
+
+    moved = 0
+    while deferred_process_ids and not process_queue.full():
+        process_id = deferred_process_ids.pop()
+        if process_id in queued_process_ids or process_id in active_jobs:
+            continue
+        record = fetch_process(process_id)
+        if not record or record["status"] == "Analyzed":
+            continue
+        queued_process_ids.add(process_id)
+        process_queue.put_nowait(process_id)
+        moved += 1
+        logger.info("Process %s queued from Pending backlog", process_id)
+    return moved
+
+
+async def queue_dispatcher() -> None:
+    """Continuously drain deferred Pending work as queue capacity becomes free."""
+
+    while True:
+        await asyncio.sleep(0.25)
+        fill_queue_from_backlog()
 
 
 async def call_gemini_with_controls(process_name: str, research: ResearchResult) -> ProcessIntelligence:
@@ -874,7 +949,7 @@ async def lifespan(_: FastAPI):
         recover_stale_processing_records()
         seed_processes()
         rebuild_bm25_index()
-    global worker_tasks, gemini_semaphore, gemini_rate_lock, last_gemini_request_at
+    global worker_tasks, dispatcher_task, gemini_semaphore, gemini_rate_lock, last_gemini_request_at
     gemini_semaphore = asyncio.Semaphore(MAX_AI_CONCURRENCY)
     gemini_rate_lock = asyncio.Lock()
     last_gemini_request_at = 0.0
@@ -886,15 +961,21 @@ async def lifespan(_: FastAPI):
         GEMINI_REQUEST_DELAY_SECONDS,
     )
     worker_tasks = [asyncio.create_task(worker(i + 1)) for i in range(DEFAULT_WORKER_COUNT)]
+    dispatcher_task = asyncio.create_task(queue_dispatcher())
     try:
         yield
     finally:
+        if dispatcher_task is not None:
+            dispatcher_task.cancel()
+            await asyncio.gather(dispatcher_task, return_exceptions=True)
+            dispatcher_task = None
         for task in worker_tasks:
             task.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
         worker_tasks.clear()
         active_jobs.clear()
         queued_process_ids.clear()
+        deferred_process_ids.clear()
         gemini_semaphore = None
         gemini_rate_lock = None
 
@@ -921,8 +1002,13 @@ async def health() -> dict[str, Any]:
             "status": "ok",
             "database": "connected",
             "gemini_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+            "gemini_model": GEMINI_MODEL,
             "workers": len(worker_tasks),
-            "queue_depth": process_queue.qsize(),
+            "active_workers": sum(1 for task in worker_tasks if not task.done()),
+            "configured_concurrency": MAX_AI_CONCURRENCY,
+            "queue_depth": process_queue.qsize() + len(deferred_process_ids),
+            "in_memory_queue_depth": process_queue.qsize(),
+            "deferred_pending": len(deferred_process_ids),
         }
     except sqlite3.Error as exc:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}") from exc
@@ -970,6 +1056,37 @@ async def submit_process(request: ProcessCreate) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     enqueue_process_id(record["id"])
     return {"accepted": True, "message": "Process accepted for background analysis", "process": record}
+
+
+@app.post("/load-test/processes", status_code=status.HTTP_202_ACCEPTED)
+async def load_test_processes(request: LoadTestRequest) -> dict[str, Any]:
+    """Create many Pending records safely; queueing remains bounded and optional."""
+
+    try:
+        ids, existing = create_load_test_batch(request.count, request.prefix)
+    except sqlite3.Error as exc:
+        logger.exception("Load-test batch persistence failed")
+        raise HTTPException(status_code=503, detail=f"Could not persist load-test batch: {exc}") from exc
+
+    queued = 0
+    if request.queue:
+        queued = sum(1 for process_id in ids if enqueue_process_id(process_id))
+    logger.info(
+        "Load-test batch persisted: requested=%d created=%d existing=%d queued_or_deferred=%d",
+        request.count,
+        request.count - existing,
+        existing,
+        queued,
+    )
+    return {
+        "accepted": True,
+        "message": "Load-test records persisted as Pending; Gemini is not called unless queue=true",
+        "requested": request.count,
+        "created": request.count - existing,
+        "existing": existing,
+        "queued_or_deferred": queued,
+        "sample_ids": ids[:10],
+    }
 
 
 @app.post("/processes/{process_id}/retry", status_code=status.HTTP_202_ACCEPTED)

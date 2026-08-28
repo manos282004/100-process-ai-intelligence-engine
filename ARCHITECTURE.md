@@ -75,3 +75,55 @@ One failed process is caught and persisted as Failed without terminating the que
 ## Scalability boundary
 
 For the challenge, SQLite and an in-process queue are appropriate for a single local FastAPI process. For approximately 1,000 processes, ingestion remains fast because it only writes and queues IDs. Work is controlled by queue depth, worker count, the Gemini semaphore, request pacing, and retries. Production evolution would replace SQLite with PostgreSQL and the in-process queue with a durable broker while preserving the orchestrator and provider boundaries.
+
+## Scaling to 1,000 Processes
+
+The production horizontal architecture is:
+
+```text
+API clients
+    →
+Load Balancer
+    →
+Multiple FastAPI instances
+    →
+Shared PostgreSQL database
+    →
+Shared durable job queue
+    →
+Multiple AI worker instances
+    →
+Gemini API
+```
+
+In that design, every FastAPI instance remains lightweight: it validates input, persists the process, and publishes a job. A shared durable queue provides cross-instance delivery, visibility timeouts, and recovery. Multiple worker instances consume jobs while a shared concurrency/rate-limit policy protects Gemini. PostgreSQL provides safe concurrent writes and consistent status transitions across API and worker instances.
+
+The current hackathon deployment is intentionally local: one FastAPI instance, SQLite, an `asyncio.Queue`, up to three configurable background workers, and a semaphore that limits concurrent Gemini requests. The SQLite `Pending` rows remain the persistent backlog, while a bounded in-memory queue and dispatcher apply local backpressure. This keeps a burst of 1,000 submissions responsive without starting 1,000 AI calls. The `/load-test/processes` endpoint can create up to 1,000 Pending test records without calling Gemini, and its optional `queue=true` mode still uses the same bounded queue.
+
+### Queue metrics
+
+`GET /stats` exposes:
+
+- `total`
+- `pending`
+- `processing`
+- `analyzed`
+- `failed`
+- `queue_depth` (bounded queue plus deferred Pending backlog)
+- `active_workers`
+- `configured_concurrency`
+
+`GET /health` additionally reports the in-memory queue depth, deferred backlog, worker count, and configured Gemini model. These metrics make backpressure and gradual queue draining visible during the demonstration.
+
+### Safe load demonstration
+
+This persists 1,000 unique Pending records immediately and makes no Gemini calls:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8000/load-test/processes `
+  -ContentType "application/json" `
+  -Body '{"count":1000,"prefix":"Scalability Test Process","queue":false}'
+```
+
+The records can then be queued in controlled batches with `POST /processes/queue-pending?limit=5`. This demonstrates ingestion capacity and persistent backlog without an external API flood.
